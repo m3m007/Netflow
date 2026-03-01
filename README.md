@@ -62,7 +62,7 @@ ndpiReader ──NDJSON──► flow_monitor (Rust)
 
 | Requirement | Notes |
 |---|---|
-| Linux (x86\_64 or ARM64) | Tested on Debian 12 / Ubuntu 22.04 |
+| Linux (x86\_64 or ARM64) | Tested on Kernel 6.18.13 (Arch) |
 | `ndpiReader` ≥ 4.x | Must be on `$PATH`; see install below |
 | `libpcap` | Usually already present; needed by ndpiReader |
 | Rust ≥ 1.70 | Install via `rustup` |
