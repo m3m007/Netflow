@@ -1,4 +1,4 @@
-# ndpi-flow-monitor
+# Netflow
 
 A lightweight network flow monitor built on [nDPI](https://github.com/ntop/nDPI)'s `ndpiReader`.
 A Rust daemon captures and stores flows; a Python web server serves a live HTML5 dashboard.
@@ -213,7 +213,7 @@ python3 flow_server.py --port 8080 --data /var/run/ndpi/flows.json
 ## File layout at runtime
 
 ```
-ndpi-flow-monitor/
+Netflow/
 ├── target/release/flow_monitor   # compiled binary
 ├── flow_server.py                # web server
 │
@@ -312,8 +312,8 @@ Wants=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/ndpi-flow-monitor
-ExecStart=/opt/ndpi-flow-monitor/target/release/flow_monitor -i eth0 -f "not port 22 and not arp" --no-output
+WorkingDirectory=/opt/Netflow
+ExecStart=/opt/Netflow/target/release/flow_monitor -i eth0 -f "not port 22 and not arp" --no-output
 Restart=on-failure
 RestartSec=5
 
@@ -331,8 +331,8 @@ After=network.target
 [Service]
 Type=simple
 User=www-data
-WorkingDirectory=/opt/ndpi-flow-monitor
-ExecStart=/usr/bin/python3 /opt/ndpi-flow-monitor/flow_server.py --port 7000
+WorkingDirectory=/opt/Netflow
+ExecStart=/usr/bin/python3 /opt/Netflow/flow_server.py --port 7000
 Restart=on-failure
 RestartSec=5
 
@@ -411,4 +411,4 @@ Key quirks to be aware of if you are debugging a different build:
 
 ## License
 
-MIT
+MIT & Apache 2.0
