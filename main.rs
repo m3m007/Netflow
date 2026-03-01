@@ -528,7 +528,7 @@ async fn do_sled_flush(tree: &sled::Tree, buf: &mut Vec<FlowRecord>) {
                 Err(e)  => eprintln!("Serialise error: {e}"),
             }
         }
-        t.apply_batch(&batch)
+        t.apply_batch(batch)
     }).await;
 
     match result {
