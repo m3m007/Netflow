@@ -142,7 +142,7 @@ source "$HOME/.cargo/env"
 ### Clone and build
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ndpi-flow-monitor.git
+git clone https://github.com/m3m007/Netflow.git
 cd ndpi-flow-monitor
 
 cargo build --release
@@ -201,7 +201,7 @@ In a separate terminal, from the same directory:
 python3 flow_server.py
 ```
 
-Then open **http://\<your-tailnet-hostname\>:7000/** in a browser.
+Then open localhost:7000 or **http://\<your-tailnet-hostname\>:7000/** in a browser.
 
 ```bash
 # Custom port or data file path
