@@ -404,6 +404,16 @@ async fn parse_ndjson(
         let line = line.trim().to_owned();
         if line.is_empty() { continue; }
 
+        // ndpiReader emits some plain-text lines to stdout even with -q:
+        //   • "Successfully set BPF filter to '...'"  — one per window start
+        //   • Any other status/warning lines
+        // Silently skip anything that isn't a JSON object.  This avoids a
+        // noisy parse error on every single capture window restart.
+        if !line.starts_with('{') {
+            eprintln!("Skipping non-JSON line: {line}");
+            continue;
+        }
+
         match serde_json::from_str::<FlowRecord>(&line) {
             Ok(flow) => {
                 count += 1;
@@ -414,7 +424,7 @@ async fn parse_ndjson(
                 }
             }
             Err(e) => {
-                // Field-name mismatches show up here; with -q these should be very rare
+                // Genuine field-name mismatches — log for debugging
                 eprintln!("JSON parse error: {e}\n  line: {line}");
             }
         }
