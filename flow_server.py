@@ -2794,9 +2794,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # use the rest without being handed prose.
             self._json({
                 "endpoints": {
-                    "/api/agent/status": "compact snapshot: counts, last-24h alerts/threats, anomalous dests, geo+feed status. Capped at ~30 kB.",
-                    "/api/agent/diff?since=<ISO8601|epoch>": "events newer than `since` (kinds: threat|alert|suspicious|scanner). Echoes `cursor` to pass back next poll.",
-                    "/api/flows": "full enriched flow list (large; prefer the agent endpoints)",
+                    "/api/agent/status": "compact snapshot (see payload_schemas)",
+                    "/api/agent/diff?since=<ISO8601|epoch>": "events newer than since; echoes cursor",
+                    "/api/flows": "full enriched flow list (large; prefer agent endpoints)",
                     "/api/summary": "aggregate stats incl. top_countries + threat_count",
                     "/api/alerts": "alert/suspicious/threat flows, up to 500",
                     "/api/scanners": "port-scanner detections by source IP",
@@ -2824,6 +2824,75 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "tables": ["daily_summary(date,total_flows,bytes_out,bytes_in,distinct_dests,alerts,top_talkers_json,top_countries_json)",
                                "dest_rollup(dest_ip,iso,asn_org,asn,first_seen,last_seen,flows,bytes,alert_count)"],
                     "written_by": "distill.py",
+                },
+                # Machine-readable shape of the two agent payloads so a caller can
+                # bind fields without parsing prose. Types are JSON-Schema style;
+                # "nullable" marks fields that are present but may be null.
+                "payload_schemas": {
+                    "/api/agent/status": {
+                        "generated_at": {"type": "string", "format": "date-time"},
+                        "hot_flow_count": {"type": "integer"},
+                        "retention_days": {"type": "integer"},
+                        "db_size_mb": {"type": "number", "nullable": True},
+                        "cold_shard_count": {"type": "integer"},
+                        "alerts_last_24h": {"type": "array", "items": "$ref:event"},
+                        "alert_count_last_24h": {"type": "integer"},
+                        "threat_hits_last_24h": {"type": "array", "items": "$ref:event"},
+                        "threat_hit_count": {"type": "integer"},
+                        "top_anomalous_dests": {"type": "array", "items": {
+                            "ip": {"type": "string"},
+                            "why": {"type": "string", "enum": ["port_scanner", "threat_feed"]},
+                            "ports": {"type": "integer"},
+                            "flows": {"type": "integer"},
+                            "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+                            "threat_source": {"type": "string", "nullable": True}}},
+                        "verdicts": {"type": "object", "additionalProperties": {"type": "integer"}},
+                        "top_countries": {"type": "array", "items": {"type": "object"}},
+                        "geo": {"type": "object", "properties": {
+                            "available": {"type": "boolean"},
+                            "mmdb_dir": {"type": "string"},
+                            "city_db": {"type": "boolean"},
+                            "asn_db": {"type": "boolean"},
+                            "libmaxminddb": {"type": "string", "nullable": True},
+                            "error": {"type": "string", "nullable": True}}},
+                        "threat_feed": {"type": "object", "properties": {
+                            "path": {"type": "string"},
+                            "loaded": {"type": "boolean"},
+                            "count_ips": {"type": "integer"},
+                            "count_cidrs": {"type": "integer"},
+                            "retrieved_at": {"type": "string", "nullable": True},
+                            "source": {"type": "string", "nullable": True},
+                            "stale_sources": {"type": "array", "items": {"type": "string"}},
+                            "error": {"type": "string", "nullable": True}}},
+                    },
+                    "/api/agent/diff": {
+                        "generated_at": {"type": "string", "format": "date-time"},
+                        "since": {"type": "number", "nullable": True},
+                        "cursor": {"type": "number"},
+                        "event_count": {"type": "integer"},
+                        "events": {"type": "array", "items": "$ref:event"},
+                        "truncated": {"type": "boolean"},
+                        "warning": {"type": "string", "nullable": True},
+                    },
+                    "event": {
+                        "t": {"type": "number"},
+                        "src": {"type": "string", "nullable": True},
+                        "dst": {"type": "string", "nullable": True},
+                        "dport": {"type": "integer", "nullable": True},
+                        "proto": {"type": "string", "nullable": True},
+                        "verdict": {"type": "string", "enum": ["threat", "alert", "suspicious"]},
+                        "score": {"type": "integer"},
+                        "sev": {"type": "integer"},
+                        "risks": {"type": "array", "items": {"type": "string"}},
+                        "bytes": {"type": "integer"},
+                        "iso": {"type": "string", "nullable": True},
+                        "asn": {"type": "integer", "nullable": True},
+                        "asn_org": {"type": "string", "nullable": True},
+                        "threat_source": {"type": "string", "nullable": True},
+                        "host": {"type": "string", "nullable": True},
+                        "kind": {"type": "string", "enum": ["threat", "alert", "suspicious", "scanner"],
+                                 "note": "diff only"},
+                    },
                 },
             })
 

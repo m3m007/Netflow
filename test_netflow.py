@@ -1192,6 +1192,76 @@ class TestThreatIntelOfflineSafety(TempDirCase):
         leftovers = [p.name for p in target.parent.iterdir() if p.name != "out.json"]
         self.assertEqual(leftovers, [], f"temp files left behind: {leftovers}")
 
+    def test_urlhaus_falls_back_to_full_text_export(self):
+        """URLhaus recent endpoint down → fetch_source retries the full text/ variant."""
+        import threat_intel as ti
+        feed = ti.FEEDS["urlhaus"]
+        self.assertIn("fallback_url", feed,
+                      "urlhaus feed must declare a fallback variant")
+        primary, fallback = feed["url"], feed["fallback_url"]
+
+        seen = []
+
+        def fake_fetch_url(url, timeout=None, log=print):
+            seen.append(url)
+            if url == primary:
+                raise RuntimeError("primary text_recent is 503")
+            return b"http://203.0.113.9/bin.sh\n# banner\n"
+
+        original = ti.fetch_url
+        try:
+            ti.fetch_url = fake_fetch_url
+            record, err = ti.fetch_source("urlhaus", feed, log=lambda *a: None)
+        finally:
+            ti.fetch_url = original
+
+        self.assertIsNone(err, "fallback success must not report an error")
+        self.assertIsNotNone(record)
+        self.assertTrue(record["ok"])
+        self.assertEqual(seen, [primary, fallback],
+                         "must try primary first, then the fallback URL")
+        self.assertEqual(record["url"], fallback,
+                         "record.url reflects the endpoint that actually served")
+        self.assertTrue(record.get("via_fallback"))
+        self.assertIn("203.0.113.9", record["ips"])
+
+    def test_stale_sources_lists_every_failed_feed_sorted(self):
+        """stale_sources flags all ok:false sources (not just one), sorted, healthy omitted."""
+        import threat_intel as ti
+        out = self.tmp / "stale_multi.json"
+
+        # Pass 1: every feed succeeds, so each gets last-good history in the
+        # sidecar. A failure with no prior data is dropped outright, not marked
+        # stale — this seeds the history that makes the stale flag meaningful.
+        def good(name, feed, base_url=None, timeout=None, log=print):
+            return ({"ok": True, "url": feed["url"],
+                     "retrieved_at": "2026-10-05T00:00:00Z",
+                     "ips": ["203.0.113.%d" % len(name)], "cidrs": []}, None)
+
+        # Pass 2: feodotracker + threatfox fail; urlhaus still healthy. Their
+        # carried-forward records must be flagged stale (sorted), urlhaus not.
+        def partly(name, feed, base_url=None, timeout=None, log=print):
+            if name in ("feodotracker", "threatfox"):
+                return None, "URLError: connection refused"
+            return ({"ok": True, "url": feed["url"],
+                     "retrieved_at": "2026-10-05T01:00:00Z",
+                     "ips": ["203.0.113.%d" % len(name)], "cidrs": []}, None)
+
+        original = ti.fetch_source
+        try:
+            ti.fetch_source = good
+            ti.run_once(str(out), only={"feodotracker", "urlhaus", "threatfox"},
+                        log=lambda *a: None)
+            ti.fetch_source = partly
+            doc = ti.run_once(str(out), only={"feodotracker", "urlhaus", "threatfox"},
+                              log=lambda *a: None)
+        finally:
+            ti.fetch_source = original
+
+        self.assertEqual(doc.get("stale_sources"), ["feodotracker", "threatfox"],
+                         "both failed feeds flagged, sorted, healthy urlhaus omitted")
+        self.assertNotIn("urlhaus", doc.get("stale_sources", []))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

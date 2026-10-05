@@ -92,6 +92,7 @@ FEEDS = {
     },
     "urlhaus": {
         "url": "https://urlhaus.abuse.ch/downloads/text_recent/",
+        "fallback_url": "https://urlhaus.abuse.ch/downloads/text/",
         "parser": "urlhaus_urls",
     },
     "threatfox": {
@@ -353,27 +354,43 @@ def fetch_url(url: str, timeout: int = TIMEOUT, retries: int = RETRIES,
 
 def fetch_source(name: str, feed: dict, base_url=None, timeout=TIMEOUT,
                  log=print):
-    """Fetch + parse one feed. Returns (record_dict|None, err_string|None)."""
-    url = apply_base_override(feed["url"], base_url)
+    """Fetch + parse one feed. Returns (record_dict|None, err_string|None).
+
+    Tries the feed's primary URL, then any ``fallback_url`` (e.g. URLhaus' full
+    ``text/`` export when the recent ``text_recent/`` endpoint is down) before
+    declaring the source failed. The first URL that returns a 2xx body wins; its
+    parsed result is recorded under whichever URL actually served it.
+    """
     parser = PARSERS[feed["parser"]]
-    try:
-        body = fetch_url(url, timeout=timeout, log=log)
-    except Exception as exc:                           # noqa: BLE001 — never fatal
-        return None, f"{type(exc).__name__}: {exc}"
-    text = body.decode("utf-8", errors="replace")
-    parsed = parser(text)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    record = {
-        "ok": True,
-        "url": url,
-        "retrieved_at": now,
-        "ips": parsed["ips"],
-        "cidrs": parsed["cidrs"],
-    }
-    for extra in ("rejected", "skipped_non_ip_hosts", "skipped_rows"):
-        if parsed.get(extra):
-            record[extra] = parsed[extra]
-    return record, None
+    candidates = [apply_base_override(feed["url"], base_url)]
+    if feed.get("fallback_url"):
+        candidates.append(apply_base_override(feed["fallback_url"], base_url))
+    last_err = None
+    for url in candidates:
+        try:
+            body = fetch_url(url, timeout=timeout, log=log)
+        except Exception as exc:                       # noqa: BLE001 — never fatal
+            last_err = f"{type(exc).__name__}: {exc}"
+            if url != candidates[-1]:
+                log(f"    [{name}] {url} failed ({last_err}); trying fallback")
+            continue
+        text = body.decode("utf-8", errors="replace")
+        parsed = parser(text)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        record = {
+            "ok": True,
+            "url": url,
+            "retrieved_at": now,
+            "ips": parsed["ips"],
+            "cidrs": parsed["cidrs"],
+        }
+        if url != candidates[0]:
+            record["via_fallback"] = True
+        for extra in ("rejected", "skipped_non_ip_hosts", "skipped_rows"):
+            if parsed.get(extra):
+                record[extra] = parsed[extra]
+        return record, None
+    return None, last_err
 
 
 # ─────────────────────────────────────────────────────────────────────────────
