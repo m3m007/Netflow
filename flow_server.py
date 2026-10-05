@@ -11,22 +11,35 @@ Endpoints:
   GET /api/scanners  → top scanner IPs with breadth/intensity metrics
   GET /api/timeline  → per-minute bytes/packets/alerts for sparklines
   GET /api/protocols → protocol + category distribution
-  GET /api/alerts    → only alert/suspicious flows, newest first
+  GET /api/alerts    → alert/suspicious/threat flows, newest first
+  GET /api/agent/status  → compact machine-readable snapshot (<30 kB, Task 4)
+  GET /api/agent/diff?since=<ISO> → events newer than since (Task 4)
+  GET /api/agent/schema → endpoint contract + verdict meanings (Task 4)
   GET /favicon.ico   → inline SVG fallback
+
+Per-flow fields added by enrichment: country_iso, asn, asn_org, dest_geo
+(from GeoLite2 via libmaxminddb/ctypes, null when unavailable) and
+threat_source (exact IP/CIDR matched from threats.json, Task 3).
 
 Usage:
   python3 flow_server.py [--port 7000] [--data ./ndpi_state/flows.json]
                          [--html ./html] [--whitelist ./whitelist.json]
+                         [--mmdb-dir /usr/share/GeoIP]
+                         [--threats ./ndpi_state/threats.json]
+                         [--retain-days 7]
 """
 
+import argparse
+import ctypes
 import http.server
+import ipaddress
 import json
 import math
 import mimetypes
 import os
 import re
 import time
-import argparse
+import urllib.parse
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +48,11 @@ DEFAULT_PORT       = 7000
 DEFAULT_DATA_FILE  = "./ndpi_state/flows.json"
 DEFAULT_HTML_DIR   = "./html"
 DEFAULT_WHITELIST  = "./whitelist.json"
+# GeoLite2 databases + threat feed live beside flows.json by default.
+DEFAULT_MMDB_DIR   = os.environ.get("NETFLOW_MMDB_DIR", "/usr/share/GeoIP")
+DEFAULT_THREATS    = "./ndpi_state/threats.json"
+DEFAULT_SUMMARY_DB = "./ndpi_state/summary.sqlite"
+DEFAULT_COLD_DIR   = os.environ.get("FLOW_COLD_DIR", "./cold")
 
 EXTRA_MIME = {
     ".ico": "image/x-icon", ".png": "image/png", ".svg": "image/svg+xml",
@@ -79,12 +97,565 @@ DEFAULT_WHITELIST_DATA = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GeoIP / ASN enrichment (Task 1) — libmaxminddb through ctypes.
+#
+# WHY ctypes and not a pip package or a hand-written mmdb parser:
+#   * The Python server must stay stdlib-only (hard constraint), so `maxminddb`
+#     from PyPI is out.
+#   * libmaxminddb IS installed on this host (/usr/lib/libmaxminddb.so.0, with
+#     headers in /usr/include/maxminddb.h) and ctypes ships with CPython, so we
+#     get MaxMind's real, tested tree walk for free instead of reimplementing
+#     it (IPv6 trees, extended records, ipv4_start_node, every data type…).
+#   * If the .so or the .mmdb files are missing (owner has not run geoipupdate
+#     yet), GeoReader.available stays False and every lookup returns None: flows
+#     carry null geo fields. Nothing crashes, startup never blocks.
+#
+# Struct layouts below were verified against the installed header by compiling
+# offsetof()/sizeof() probes (not guessed):
+#   sizeof(MMDB_s)=136  sizeof(MMDB_entry_data_s)=48  sizeof(MMDB_lookup_result_s)=32
+#   MMDB_entry_data_s: has_data@0 | union{utf8_string,uint16,uint32,int32,uint64}@16
+#                      offset@32  offset_to_next@36  data_size@40  type@44
+#   MMDB_lookup_result_s: found_entry@0 | entry(MMDB_entry_s){mmdb@0,offset@8}@8 | netmask@24
+#   MMDB_SUCCESS=0; data types UTF8=2 UINT16=5 UINT32=6 INT32=8 UINT64=9 DOUBLE=3 BOOL=14
+# We use MMDB_aget_value (the char** path form of the varargs MMDB_get_value)
+# because ctypes cannot safely synthesise C varargs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+MMDB_SUCCESS = 0
+_MMDB_TYPE_UTF8   = 2
+_MMDB_TYPE_UINT16 = 5
+_MMDB_TYPE_UINT32 = 6
+_MMDB_TYPE_INT32  = 8
+_MMDB_TYPE_UINT64 = 9
+
+
+class _MMDBHandle(ctypes.Structure):
+    """MMDB_s — allocated BY US and filled in by MMDB_open.
+
+    The library's own header warns that this struct's size is ABI-frozen ("do
+    not add new fields without bumping the SONAME"), which is exactly what makes
+    a fixed-size opaque buffer safe here: MMDB_open only ever writes the bytes
+    the compiled header says the struct occupies.
+    """
+    _fields_ = [("raw", ctypes.c_uint8 * 136)]
+
+
+class _MMDBEntry(ctypes.Structure):
+    """MMDB_entry_s — a pointer into the data section for one IP's record."""
+    _fields_ = [
+        ("mmdb",   ctypes.c_void_p),
+        ("offset", ctypes.c_uint32),
+    ]
+
+
+class _MMDBEntryData(ctypes.Structure):
+    """MMDB_entry_data_s (48 bytes) — scalar value decoded from an entry.
+
+    C's anonymous union at offset 16 cannot be spelled in ctypes, and the two
+    obvious attempts both fail *silently* (they produce a struct that loads fine
+    and returns has_data=True/type=0 for every real record):
+
+      * sibling fields utf8_string/uint16/uint32/int32/uint64 → each gets its own
+        storage; sizeof becomes 56.
+      * byte-array padding → ctypes gives c_uint8*N alignment 1 and never inserts
+        slack before the next field, so pointers end up at 8 instead of 16.
+
+    Fix: `_pack_ = 1` disables all implicit padding, then explicit reserved
+    blocks place every field at the offset offsetof() reported for this host:
+        has_data@0  union(utf8_string|u16|u32|i32|u64)@16  offset@32
+        offset_to_next@36  data_size@40  type@44   sizeof=48
+    Narrower union members are read as raw bytes out of the same 16-byte slot.
+
+    `_layout_ = 'ms'` is declared explicitly because combining `_pack_` with the
+    default layout is deprecated (it warns since 3.14 and becomes an error in
+    3.19). MSVC layout is what we want: with _pack_=1 both gcc and msvc produce
+    the same byte-for-byte offsets, which the layout tests assert against the
+    offsetof() values measured from the installed header.
+    """
+    _pack_ = 1
+    _layout_ = 'ms'
+    _fields_ = [
+        ("has_data",       ctypes.c_bool),        # @0
+        ("_pad0",          ctypes.c_uint8 * 15),  # @1..15
+        ("utf8_string",    ctypes.c_void_p),      # @16 (union slot, pointer view)
+        ("_pad1",          ctypes.c_uint8 * 8),   # @24..31 rest of the union
+        ("offset",         ctypes.c_uint32),      # @32
+        ("offset_to_next", ctypes.c_uint32),      # @36
+        ("data_size",      ctypes.c_uint32),      # @40
+        ("type",           ctypes.c_uint32),      # @44
+    ]
+
+    _UNION_OFF = 16
+
+    def _union_bytes(self, n: int) -> bytes:
+        """Raw bytes of the first n bytes of the union slot at @16."""
+        return ctypes.string_at(ctypes.addressof(self) + self._UNION_OFF, n)
+
+    def u16(self):
+        return int.from_bytes(self._union_bytes(2), "little")
+
+    def u32(self):
+        return int.from_bytes(self._union_bytes(4), "little")
+
+    def i32(self):
+        return int.from_bytes(self._union_bytes(4), "little", signed=True)
+
+    def u64(self):
+        return int.from_bytes(self._union_bytes(8), "little")
+
+
+class _MMDBLookupResult(ctypes.Structure):
+    """MMDB_lookup_result_s (32 bytes) — returned by value from MMDB_lookup_string.
+
+    found_entry@0 | pad@1..7 | entry(MMDB_entry_s)@8..23 | netmask@24 | pad@26..31
+    See _MMDBEntryData for why _pack_ and _layout_ are both explicit.
+    """
+    _pack_ = 1
+    _layout_ = 'ms'
+    _fields_ = [
+        ("found_entry", ctypes.c_bool),      # @0
+        ("_pad0",       ctypes.c_uint8 * 7), # @1..7
+        ("entry",       _MMDBEntry),         # @8..23
+        ("netmask",     ctypes.c_uint16),    # @24
+        ("_pad1",       ctypes.c_uint8 * 6), # @26..31
+    ]
+
+
+def _load_libmaxminddb():
+    """Return a configured CDLL, or None if unavailable. Never raises."""
+    candidates = ("libmaxminddb.so.0", "libmaxminddb.so",
+                  "/usr/lib/libmaxminddb.so.0", "/usr/lib64/libmaxminddb.so.0")
+    for name in candidates:
+        try:
+            lib = ctypes.CDLL(name)
+        except OSError:
+            continue
+        try:
+            lib.MMDB_open.argtypes = [ctypes.c_char_p, ctypes.c_uint32,
+                                      ctypes.POINTER(_MMDBHandle)]
+            lib.MMDB_open.restype = ctypes.c_int
+            lib.MMDB_close.argtypes = [ctypes.POINTER(_MMDBHandle)]
+            lib.MMDB_close.restype = None
+            lib.MMDB_strerror.argtypes = [ctypes.c_int]
+            lib.MMDB_strerror.restype = ctypes.c_char_p
+            lib.MMDB_lib_version.argtypes = []
+            lib.MMDB_lib_version.restype = ctypes.c_char_p
+            lib.MMDB_lookup_string.argtypes = [ctypes.POINTER(_MMDBHandle),
+                                               ctypes.c_char_p,
+                                               ctypes.POINTER(ctypes.c_int),
+                                               ctypes.POINTER(ctypes.c_int)]
+            lib.MMDB_lookup_string.restype = _MMDBLookupResult
+            lib.MMDB_aget_value.argtypes = [ctypes.POINTER(_MMDBEntry),
+                                            ctypes.POINTER(_MMDBEntryData),
+                                            ctypes.POINTER(ctypes.c_char_p)]
+            lib.MMDB_aget_value.restype = ctypes.c_int
+        except (OSError, AttributeError):
+            return None
+        return lib
+    return None
+
+
+class GeoReader:
+    """Crash-proof GeoLite2 City + ASN reader over libmaxminddb.
+
+    `available` is False unless the library loaded AND at least one database
+    opened. Every lookup then degrades to None, so callers must treat geo as
+    optional — that is the brief's "never crash, degrade gracefully" rule.
+    Results are cached per (kind, ip); feeds churn far less than flows do.
+    """
+
+    def __init__(self, mmdb_dir: str = DEFAULT_MMDB_DIR,
+                 city_file: str = "GeoLite2-City.mmdb",
+                 asn_file: str = "GeoLite2-ASN.mmdb"):
+        self.mmdb_dir = mmdb_dir
+        self.city_file = city_file
+        self.asn_file = asn_file
+        self.city_path = Path(mmdb_dir) / city_file
+        self.asn_path = Path(mmdb_dir) / asn_file
+        self.lib = None
+        self._city = None      # (_MMDBHandle, c_void_p kept alive)
+        self._asn = None
+        self.error = None
+        self.available = False
+        self._cache = {}
+        self._cache_max = 50_000
+        self.lookups = 0
+        self.hits = 0
+        self._open()
+
+    # ── lifecycle ────────────────────────────────────────────────────────────
+
+    def _open(self):
+        try:
+            self.lib = _load_libmaxminddb()
+            if self.lib is None:
+                self.error = "libmaxminddb not found (install libmaxminddb)"
+                return
+            if not self.city_path.is_file() and not self.asn_path.is_file():
+                self.error = f"no GeoLite2 databases under {self.mmdb_dir}"
+                return
+            self._city = self._open_one(self.city_path)
+            self._asn = self._open_one(self.asn_path)
+            self.available = bool(self._city or self._asn)
+            if not self.available and not self.error:
+                self.error = "databases present but none opened"
+        except Exception as exc:                    # pragma: no cover - defensive
+            self.error = f"geo init error: {exc}"
+            self.available = False
+
+    def _open_one(self, path: Path):
+        if not path.is_file():
+            return None
+        try:
+            handle = _MMDBHandle()
+            rc = self.lib.MMDB_open(str(path).encode("utf-8", "surrogateescape"),
+                                    0, ctypes.byref(handle))
+            if rc != MMDB_SUCCESS:
+                msg = self.lib.MMDB_strerror(rc)
+                self.error = f"{path.name}: {msg.decode('utf-8','replace') if msg else rc}"
+                return None
+            # The handle must outlive every lookup made with it, so we keep the
+            # struct AND a raw pointer to it on the instance.
+            ptr = ctypes.cast(ctypes.byref(handle), ctypes.c_void_p)
+            holder = (handle, ptr, path)
+            return holder
+        except Exception as exc:                    # pragma: no cover - defensive
+            self.error = f"{path.name}: {exc}"
+            return None
+
+    def close(self):
+        for attr in ("_city", "_asn"):
+            db = getattr(self, attr, None)
+            if db is not None and self.lib is not None:
+                try:
+                    self.lib.MMDB_close(ctypes.byref(db[0]))
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+        self.available = False
+
+    def __del__(self):                              # pragma: no cover - GC timing
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    # ── decoding ─────────────────────────────────────────────────────────────
+
+    def _scalar(self, ent: "_MMDBEntryData"):
+        """Convert a decoded entry into str/int, or None if not a usable scalar.
+
+        has_data must be checked explicitly: MMDB_aget_value returns MMDB_SUCCESS
+        for a key path that does not exist in this record, leaving type == 0
+        (MMDB_DATA_TYPE_UNKNOWN) with has_data cleared. Only checking rc makes
+        every lookup look like a miss.
+        """
+        if not ent.has_data:
+            return None
+        t = ent.type
+        try:
+            if t == _MMDB_TYPE_UTF8:
+                size = ent.data_size
+                addr = ent.utf8_string
+                if not size or not addr:
+                    return None
+                # utf8_string points INTO the mmap'd data section and is not
+                # NUL-terminated — read exactly data_size bytes.
+                raw = ctypes.string_at(addr, size)
+                return raw.decode("utf-8", "replace")
+            if t == _MMDB_TYPE_UINT32:
+                return ent.u32()
+            if t == _MMDB_TYPE_UINT16:
+                return ent.u16()
+            if t == _MMDB_TYPE_UINT64:
+                return ent.u64()
+            if t == _MMDB_TYPE_INT32:
+                return ent.i32()
+        except Exception:
+            return None
+        return None
+
+    def _get(self, entry: "_MMDBEntry", *keys: str):
+        """Read one value at a key path relative to a looked-up ENTRY.
+
+        MMDB_aget_value walks a map starting where `entry` points, so passing a
+        root entry (offset 0) here would return MMDB_NOT_MAPPABLE — the record
+        for an IP is not itself a map root. Callers get their entry from
+        _lookup_entry() and hand it back in.
+
+        Note the two distinct failure modes, both observed against real GeoLite2:
+          * rc != MMDB_SUCCESS            → structurally wrong (not a map, bad db)
+          * rc == 0 but has_data == False → the key path simply does not exist in
+            this record (e.g. ASN databases have no 'country' key). The library
+            reports that as success with an empty entry_data, so checking only
+            the return code silently yields None for every lookup.
+        """
+        ent = _MMDBEntryData()
+        n = len(keys)
+        arr = (ctypes.c_char_p * (n + 1))()
+        for i, k in enumerate(keys):
+            arr[i] = k.encode("utf-8")
+        arr[n] = None  # NULL-terminated path, as MMDB_aget_value expects
+        rc = self.lib.MMDB_aget_value(ctypes.byref(entry), ctypes.byref(ent), arr)
+        if rc != MMDB_SUCCESS:
+            return None
+        # A missing key path is reported as SUCCESS with has_data cleared, so
+        # _scalar() (which requires has_data) is the real gatekeeper here.
+        return self._scalar(ent)
+
+    def _lookup_entry(self, db, ip: str):
+        """Return the MMDB_entry_s for `ip`, or None when absent/unusable."""
+        handle, ptr, _ = db
+        gai = ctypes.c_int(0)
+        merr = ctypes.c_int(0)
+        try:
+            res = self.lib.MMDB_lookup_string(ctypes.byref(handle),
+                                              ip.encode("utf-8"),
+                                              ctypes.byref(gai), ctypes.byref(merr))
+        except Exception:
+            return None
+        if gai.value != MMDB_SUCCESS or merr.value != MMDB_SUCCESS:
+            return None
+        if not res.found_entry:
+            return None
+        # The returned struct embeds a pointer into `handle`; keep both alive by
+        # re-anchoring mmdb to the pointer we already own.
+        entry = res.entry
+        entry.mmdb = ptr
+        return entry
+
+    # ── public lookups ───────────────────────────────────────────────────────
+
+    def city(self, ip: str):
+        """{'country_iso','country_name','city'} | None."""
+        return self._lookup(ip, "city")
+
+    def asn(self, ip: str):
+        """{'asn','asn_org'} | None."""
+        return self._lookup(ip, "asn")
+
+    def _lookup(self, ip: str, kind: str):
+        if not self.available or not ip:
+            return None
+        ck = (kind, ip)
+        self.lookups += 1
+        if ck in self._cache:
+            self.hits += 1
+            return self._cache[ck]
+        out = None
+        try:
+            if kind == "city" and self._city is not None:
+                entry = self._lookup_entry(self._city, ip)
+                if entry is not None:
+                    iso = self._get(entry, "country", "iso_code")
+                    cname = self._get(entry, "country", "names", "en")
+                    city = self._get(entry, "city", "names", "en")
+                    if iso or cname or city:
+                        out = {"country_iso": iso, "country_name": cname, "city": city}
+            elif kind == "asn" and self._asn is not None:
+                entry = self._lookup_entry(self._asn, ip)
+                if entry is not None:
+                    num = self._get(entry, "autonomous_system_number")
+                    org = self._get(entry, "autonomous_system_organization")
+                    if num is not None or org:
+                        out = {"asn": num, "asn_org": org}
+        except Exception:
+            out = None
+        if len(self._cache) < self._cache_max:
+            self._cache[ck] = out
+        return out
+
+    def status(self) -> dict:
+        libver = None
+        if self.lib is not None:
+            try:
+                libver = self.lib.MMDB_lib_version().decode("utf-8", "replace")
+            except Exception:
+                libver = None
+        return {
+            "available": self.available,
+            "mmdb_dir": self.mmdb_dir,
+            "city_db": bool(self._city),
+            "asn_db": bool(self._asn),
+            "libmaxminddb": libver,
+            "error": self.error,
+            "cache_entries": len(self._cache),
+            "lookups": self.lookups,
+            "cache_hits": self.hits,
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CIDR matching (Task 1 trusted prefixes + Task 3 threat prefixes)
+#
+# The brief says a full trie isn't needed: threat feeds publish /24–/32 and the
+# whitelist holds a handful of prefixes. We therefore keep two small buckets —
+# exact IPs (O(1) set) and parsed networks probed longest-prefix-first — which
+# stays fast at feed size and needs no third-party module.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_cidr(text: str):
+    """'1.2.3.0/24' or bare '1.2.3.4' → ip_network(strict=False), else None."""
+    try:
+        text = text.strip()
+        if not text:
+            return None
+        if "/" in text:
+            return ipaddress.ip_network(text, strict=False)
+        return ipaddress.ip_network(text + "/32" if ":" not in text else text + "/128",
+                                    strict=False)
+    except ValueError:
+        return None
+
+
+def match_network(ip: str, nets) -> bool:
+    """True if `ip` falls inside any network in `nets`."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for net in nets:
+        if addr in net:
+            return True
+    return False
+
+
+_PREFIX_CACHE = {}
+
+
+def _compile_prefixes(prefixes) -> list:
+    """Parse a whitelist's CIDR list once and memoise it (keyed by content).
+
+    Operators edit whitelist.json rarely but every flow asks the question, so
+    re-parsing per flow would be pure waste. Bad entries are skipped rather than
+    raising — one typo must not disable the whole whitelist.
+    """
+    key = tuple(sorted(str(p) for p in (prefixes or [])))
+    cached = _PREFIX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    nets = []
+    for p in key:
+        net = parse_cidr(p)
+        if net is not None:
+            nets.append(net)
+    nets.sort(key=lambda n: -n.prefixlen)
+    _PREFIX_CACHE[key] = nets
+    return nets
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Threat feed (Task 3) — reads threats.json written by threat_intel.py.
+#
+# Matching contract with threat_intel.py's output schema:
+#   {"retrieved_at", "epoch", "source", "ips": [...], "cidrs": [...], ...}
+# Exact IPs hit an O(1) set; CIDRs are parsed once and probed in order. The
+# file is refreshed on mtime change so a poller update lands without a restart,
+# and any read/parse failure keeps the LAST GOOD set rather than going blind.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ThreatStore:
+    def __init__(self, path: str = DEFAULT_THREATS):
+        self.path = path
+        self.ips = set()
+        self.nets = []
+        self.retrieved_at = None
+        self.source = None
+        self.stale_sources = []
+        self.loaded_at = None
+        self.error = None
+        self._mtime = 0
+        self.reload(force=True)
+
+    def reload(self, force: bool = False) -> bool:
+        """Re-read threats.json if its mtime changed. Returns True if usable."""
+        p = Path(self.path)
+        try:
+            mtime = p.stat().st_mtime
+        except FileNotFoundError:
+            if not self.ips and not self.nets:
+                self.error = f"no threat file at {p} (run threat_intel.py)"
+            return bool(self.ips or self.nets)
+        except OSError as exc:
+            self.error = f"stat failed: {exc}"
+            return bool(self.ips or self.nets)
+
+        if mtime == self._mtime and not force:
+            return bool(self.ips or self.nets)
+
+        try:
+            with open(p, "r") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            # Keep whatever we already had — a corrupt or half-written refresh
+            # must never disable matching.
+            self.error = f"parse failed: {exc}"
+            self._mtime = mtime
+            return bool(self.ips or self.nets)
+
+        if not isinstance(data, dict):
+            self.error = "threats.json is not an object"
+            self._mtime = mtime
+            return bool(self.ips or self.nets)
+
+        ips = {str(x).strip() for x in (data.get("ips") or []) if isinstance(x, str)}
+        nets = []
+        for c in (data.get("cidrs") or []):
+            net = parse_cidr(str(c)) if isinstance(c, str) else None
+            if net is not None:
+                nets.append(net)
+        # Longest prefix first so a /32 beats the /24 that contains it (only the
+        # matched source string is reported, so ordering affects nothing else).
+        nets.sort(key=lambda n: -n.prefixlen)
+
+        self.ips = ips
+        self.nets = nets
+        self.retrieved_at = data.get("retrieved_at")
+        self.source = data.get("source")
+        self.stale_sources = list(data.get("stale_sources") or [])
+        self.loaded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.error = None
+        self._mtime = mtime
+        return bool(ips or nets)
+
+    def match(self, ip: str):
+        """Return 'ip' or the matching CIDR string when `ip` is listed, else None."""
+        if not ip:
+            return None
+        if ip in self.ips:
+            return ip
+        if self.nets and match_network(ip, self.nets):
+            for net in self.nets:
+                try:
+                    if ipaddress.ip_address(ip) in net:
+                        return str(net)
+                except ValueError:
+                    return None
+        return None
+
+    def status(self) -> dict:
+        return {
+            "path": self.path,
+            "loaded": bool(self.ips or self.nets),
+            "count_ips": len(self.ips),
+            "count_cidrs": len(self.nets),
+            "retrieved_at": self.retrieved_at,
+            "source": self.source,
+            "stale_sources": self.stale_sources,
+            "error": self.error,
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Flow analytics engine
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FlowAnalytics:
-    def __init__(self, whitelist_path: str):
+    def __init__(self, whitelist_path: str, geo: "GeoReader|None" = None,
+                 threats: "ThreatStore|None" = None):
         self.whitelist_path = whitelist_path
+        self.geo = geo if geo is not None else GeoReader()
+        self.threats = threats if threats is not None else ThreatStore()
         self._whitelist = None
         self._wl_mtime = 0
 
@@ -108,20 +679,74 @@ class FlowAnalytics:
                 self._whitelist = DEFAULT_WHITELIST_DATA
         return self._whitelist
 
-    def _is_whitelisted(self, flow: dict, wl: dict) -> bool:
-        nd = flow.get("ndpi") or {}
-        # proto_by_ip_id is nDPI's IP-reputation database ID (e.g. 126 = Google).
-        # We match it against the "asns" list in the whitelist (reusing the same
-        # list for simplicity — operators can add IDs they trust).
-        ip_db_id = nd.get("proto_by_ip_id")
-        if ip_db_id and ip_db_id in wl.get("asns", []):
+    def _geo_for(self, ip: str) -> dict:
+        """Country + ASN for one destination IP, or an empty stub.
+
+        Returns a dict with all keys present (None values) so the JSON shape is
+        stable for the dashboard whether or not GeoLite2 is installed — that is
+        the graceful-degradation contract from Task 1.
+        """
+        out = {"country_iso": None, "country_name": None, "city": None,
+               "asn": None, "asn_org": None}
+        if self.geo is None or not getattr(self.geo, "available", False) or not ip:
+            return out
+        try:
+            c = self.geo.city(ip)
+            a = self.geo.asn(ip)
+        except Exception:
+            return out
+        if c:
+            out["country_iso"] = c.get("country_iso")
+            out["country_name"] = c.get("country_name")
+            out["city"] = c.get("city")
+        if a:
+            out["asn"] = a.get("asn")
+            out["asn_org"] = a.get("asn_org")
+        return out
+
+    def _is_whitelisted(self, flow: dict, wl: dict, geo: dict | None = None) -> bool:
+        """True when the destination is a network the operator trusts.
+
+        Preference order matters (Task 1): the REAL ASN number from GeoLite2-ASN
+        is authoritative; nDPI's proto_by_ip_id and org-name fragments are
+        fallbacks that only apply while geo is unavailable, because proto_by_ip_id
+        is an nDPI reputation id, not an ASN, and hostname fragments match on
+        whatever string the client happened to send.
+        """
+        geo = geo or {}
+        asn = geo.get("asn")
+        trusted_asns = wl.get("asns", []) or []
+
+        # 1. Authoritative: ASN resolved from the destination IP itself.
+        if asn is not None and asn in trusted_asns:
             return True
-        # Match known-safe org names against the nDPI hostname extracted from DNS/HTTP,
-        # and against the top-level server_hostname (TLS SNI from ClientHello).
-        hostname = (nd.get("hostname") or flow.get("server_hostname") or "").lower()
-        for frag in wl.get("org_fragments", []):
-            if frag.lower() in hostname:
+
+        # 2. Trusted prefixes (CIDR) — independent of any database.
+        prefixes = wl.get("prefixes", []) or []
+        dest_ip = flow.get("dest_ip") or ""
+        if prefixes and dest_ip:
+            nets = _compile_prefixes(prefixes)
+            if nets and match_network(dest_ip, nets):
                 return True
+
+        # 3. Fallback: nDPI's IP-reputation id matched against the same list.
+        #    Skipped when geo told us the real ASN and it was NOT trusted — a
+        #    reputation guess must not override a fact.
+        nd = flow.get("ndpi") or {}
+        if asn is None:
+            ip_db_id = nd.get("proto_by_ip_id")
+            if ip_db_id and ip_db_id in trusted_asns:
+                return True
+
+        # 4. Fallback: known-safe org names in the SNI/hostname, used only when
+        #    the ASN lookup gave us nothing.
+        if asn is None and geo.get("asn_org") is None:
+            hostname = (nd.get("hostname") or flow.get("server_hostname") or "").lower()
+            org = (geo.get("asn_org") or "").lower()
+            for frag in wl.get("org_fragments", []) or []:
+                f = frag.lower()
+                if f and (f in hostname or f in org):
+                    return True
         return False
 
     def _risk_names(self, flow: dict) -> list[str]:
@@ -152,8 +777,17 @@ class FlowAnalytics:
                 elif s == "low":    sev = max(sev, 1)
         return sev
 
-    def _verdict(self, flow: dict, risk_names: list[str], whitelisted: bool, score: int) -> tuple[str, str]:
-        """Returns (verdict, reason). Verdicts: safe | noise | suspicious | alert"""
+    def _verdict(self, flow: dict, risk_names: list[str], whitelisted: bool, score: int,
+                 threat_match: str | None = None) -> tuple[str, str]:
+        """Returns (verdict, reason). Verdicts: threat|safe|noise|suspicious|alert
+
+        `threat` outranks everything, including the whitelist: an IP listed by
+        abuse.ch is not trusted just because it sits in a friendly ASN, and
+        silently downgrading it would be the worst possible failure mode here.
+        """
+        if threat_match:
+            return "threat", f"threat_feed_match: {threat_match}"
+
         # High-signal risks always alert regardless of whitelist
         hs = [r for r in risk_names if r in HIGH_SIGNAL_RISKS]
         if hs:
@@ -186,6 +820,9 @@ class FlowAnalytics:
 
     def enrich(self, raw_flows: list) -> list:
         wl = self._load_whitelist()
+        # Refresh the feed at most once per enrich pass (mtime-gated inside).
+        self.threats.reload()
+        geo_available = bool(self.geo and self.geo.available)
         enriched = []
         for f in raw_flows:
             nd   = f.get("ndpi") or {}
@@ -193,8 +830,15 @@ class FlowAnalytics:
             iat  = f.get("iat")  or {}
             risk_names = self._risk_names(f)
             score = nd.get("ndpi_risk_score") or 0
-            whitelisted = self._is_whitelisted(f, wl)
-            verdict, reason = self._verdict(f, risk_names, whitelisted, score)
+
+            dest_ip = f.get("dest_ip") or ""
+            geo = self._geo_for(dest_ip) if geo_available else {
+                "country_iso": None, "country_name": None, "city": None,
+                "asn": None, "asn_org": None}
+            threat_match = self.threats.match(dest_ip)
+
+            whitelisted = self._is_whitelisted(f, wl, geo)
+            verdict, reason = self._verdict(f, risk_names, whitelisted, score, threat_match)
             severity = self._max_severity(f)
 
             # Bytes and packets live under "xfer" with src2dst/dst2src naming
@@ -208,6 +852,10 @@ class FlowAnalytics:
             # TLS SNI is at top level as "server_hostname" (from ClientHello),
             # not inside ndpi{} — the ndpi.tls sub-object has ja3/cipher/etc.
             sni = f.get("server_hostname") or ""
+
+            city_part = geo["city"] or ""
+            country_part = geo["country_name"] or geo["country_iso"] or ""
+            dest_geo = ", ".join(p for p in (city_part, country_part) if p) or None
 
             enriched.append({
                 **f,
@@ -226,6 +874,15 @@ class FlowAnalytics:
                 "_reason":      reason,
                 "_whitelisted": whitelisted,
                 "_sni":         sni,
+                # ── Task 1: GeoIP / ASN enrichment ────────────────────────────
+                "country_iso":  geo["country_iso"],
+                "asn":          geo["asn"],
+                "asn_org":      geo["asn_org"],
+                "dest_geo":     dest_geo,
+                "_geo":         geo,
+                # ── Task 3: threat-feed join on dest_ip ───────────────────────
+                "threat_source": threat_match,
+                "_threat":      bool(threat_match),
             })
         return enriched
 
@@ -235,11 +892,13 @@ class FlowAnalytics:
         category_counts = defaultdict(int)
         src_ip_bytes = defaultdict(int)
         src_ip_alerts = defaultdict(int)
+        dest_country_counts = defaultdict(int)
         scanner_data = defaultdict(lambda: {"ports": set(), "bytes": 0, "flows": 0, "risks": set()})
         enc_count = 0
         total_bytes = 0
         total_pkts = 0
         alert_flows = []
+        threat_flows = []
 
         for f in flows:
             v = f.get("_verdict", "safe")
@@ -259,10 +918,18 @@ class FlowAnalytics:
             if nd.get("encrypted"):
                 enc_count += 1
 
+            iso = f.get("country_iso")
+            if iso:
+                dest_country_counts[iso] += 1
+
             src = f.get("src_ip", "")
             src_ip_bytes[src] += b
 
-            if v in ("alert", "suspicious"):
+            if v == "threat":
+                threat_flows.append(f)
+                alert_flows.append(f)
+                src_ip_alerts[src] += 1
+            elif v in ("alert", "suspicious"):
                 alert_flows.append(f)
                 src_ip_alerts[src] += 1
 
@@ -300,6 +967,7 @@ class FlowAnalytics:
 
         top_proto = sorted(proto_bytes.items(), key=lambda x: x[1], reverse=True)
         top_cat   = sorted(category_counts.items(), key=lambda x: x[1], reverse=True)
+        top_countries = sorted(dest_country_counts.items(), key=lambda x: x[1], reverse=True)
 
         return {
             "total_flows":   len(flows),
@@ -310,11 +978,14 @@ class FlowAnalytics:
             "enc_pct":       round(enc_count * 100 / len(flows), 1) if flows else 0,
             "top_proto":     top_proto[:10],
             "top_category":  top_cat[:10],
+            "top_countries": top_countries[:15],
             "top_talkers":   [{"ip": ip, "bytes": b} for ip, b in top_talkers],
             "top_alerters":  [{"ip": ip, "alerts": c} for ip, c in top_alerters],
             "scanners":      scanners[:20],
             "alert_count":   len(alert_flows),
             "alert_flows":   alert_flows[:50],  # newest 50 for overview
+            "threat_count":  len(threat_flows),
+            "threat_flows":  threat_flows[:50],
         }
 
     def timeline(self, flows: list) -> list:
@@ -343,6 +1014,272 @@ class FlowAnalytics:
             key=lambda x: x["ts"]
         )
         return result
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Task 4 — agent-facing surface (small, machine-readable, size-capped)
+    #
+    # Design rule from the owner: everything deterministic stays deterministic,
+    # and the agent reads ONLY these compact summaries. So every array here is
+    # explicitly capped and the whole payload is guarded to stay well under the
+    # ~32 kB budget; if it would exceed it, arrays shrink in a fixed priority
+    # order rather than the response being truncated mid-JSON.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    AGENT_BUDGET_BYTES   = 30_000   # hard ceiling for /api/agent/status
+    AGENT_MAX_ALERTS     = 50       # brief: "max 50"
+    AGENT_MAX_THREATS    = 50
+    AGENT_MAX_DESTS      = 25
+    LOOKBACK_SECS        = 86_400   # "last 24h"
+
+    @staticmethod
+    def _flow_ts(f: dict) -> float:
+        try:
+            return float(f.get("last_seen") or f.get("first_seen") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _trim_alert(self, f: dict) -> dict:
+        """Compact one flow into an agent-sized event record."""
+        nd = f.get("ndpi") or {}
+        return {
+            "t": round(self._flow_ts(f), 3),
+            "src": f.get("src_ip"),
+            "dst": f.get("dest_ip"),
+            "dport": f.get("dst_port"),
+            "proto": nd.get("proto") or f.get("proto"),
+            "verdict": f.get("_verdict"),
+            "score": f.get("_riskscore", 0),
+            "sev": f.get("_severity", 0),
+            "risks": f.get("_risknames", [])[:4],
+            "bytes": f.get("_bytes", 0),
+            "iso": f.get("country_iso"),
+            "asn": f.get("asn"),
+            "asn_org": f.get("asn_org"),
+            "threat_source": f.get("threat_source"),
+            "host": f.get("_sni") or nd.get("hostname") or None,
+        }
+
+    def agent_status(self, flows: list, retention_days: int = 7,
+                     now: float | None = None) -> dict:
+        """GET /api/agent/status — one small snapshot of everything that matters."""
+        if now is None:
+            now = time.time()
+        cutoff = now - self.LOOKBACK_SECS
+
+        recent = [f for f in flows if self._flow_ts(f) >= cutoff]
+        alerts = [f for f in recent if f.get("_verdict") in ("alert", "suspicious")]
+        threats = [f for f in recent if f.get("_verdict") == "threat"]
+
+        # newest first, then highest score as a tiebreak
+        alerts.sort(key=lambda f: (self._flow_ts(f), f.get("_riskscore", 0)), reverse=True)
+        threats.sort(key=lambda f: self._flow_ts(f), reverse=True)
+
+        summ = self.summary(flows)
+        scanners = summ.get("scanners", [])
+
+        # Destinations that look anomalous: scanner sources plus any dest hit by
+        # a threat verdict, deduped, newest evidence first.
+        anomalous = {}
+        for s in scanners:
+            anomalous[s["ip"]] = {
+                "ip": s["ip"], "why": "port_scanner", "ports": s["ports"],
+                "flows": s["flows"], "severity": s["severity"],
+            }
+        for f in threats[:self.AGENT_MAX_THREATS]:
+            ip = f.get("dest_ip")
+            if not ip:
+                continue
+            e = anomalous.setdefault(ip, {"ip": ip, "why": "threat_feed",
+                                          "ports": 0, "flows": 0, "severity": "high"})
+            e["why"] = "threat_feed"
+            e["flows"] += 1
+            e["threat_source"] = f.get("threat_source")
+        anomalous_list = sorted(anomalous.values(),
+                                key=lambda e: (-{"high": 3, "medium": 2, "low": 1}.get(e["severity"], 0),
+                                               -e["flows"]))[:self.AGENT_MAX_DESTS]
+
+        status = {
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "hot_flow_count": len(flows),
+            "retention_days": retention_days,
+            "db_size_mb": _dir_size_mb("./ndpi_db"),
+            "cold_shard_count": _count_cold_shards(),
+            "alerts_last_24h": [self._trim_alert(f) for f in alerts[:self.AGENT_MAX_ALERTS]],
+            "alert_count_last_24h": len(alerts),
+            "threat_hits_last_24h": [self._trim_alert(f) for f in threats[:self.AGENT_MAX_THREATS]],
+            "threat_hit_count": len(threats),
+            "top_anomalous_dests": anomalous_list,
+            "verdicts": summ.get("verdicts", {}),
+            "top_countries": summ.get("top_countries", [])[:10],
+            "geo": getattr(self.geo, "status", lambda: {"available": False})(),
+            "threat_feed": self.threats.status(),
+        }
+        return _shrink_to_budget(status, self.AGENT_BUDGET_BYTES)
+
+    def agent_diff(self, flows: list, since: float | None, now: float | None = None,
+                   limit: int = 200) -> dict:
+        """GET /api/agent/diff?since=<ISO|epoch> — events strictly newer than since.
+
+        Events are alerts, threat hits and newly-seen scanner sources: exactly
+        the things worth waking an agent for. A polling agent stores the returned
+        `cursor` and passes it back next time, so each fetch costs only the delta.
+        """
+        if now is None:
+            now = time.time()
+        bad_since = False
+        if since is None:
+            cutoff = now - 3600          # no argument → last hour
+        elif isinstance(since, (int, float)):
+            cutoff = float(since)
+        else:
+            parsed = parse_iso_maybe(str(since))
+            if parsed is None:
+                bad_since = True
+                cutoff = now - 3600
+            else:
+                cutoff = parsed
+
+        events = []
+        for f in flows:
+            ts = self._flow_ts(f)
+            if ts <= cutoff:
+                continue
+            v = f.get("_verdict")
+            if v == "threat":
+                kind = "threat"
+            elif v == "alert":
+                kind = "alert"
+            elif v == "suspicious":
+                kind = "suspicious"
+            else:
+                continue
+            ev = self._trim_alert(f)
+            ev["kind"] = kind
+            events.append(ev)
+
+        # Scanner detections are per-source aggregates, emitted as their own kind
+        # so an agent can dedupe on (kind, ip) instead of re-reading flows.
+        summ = self.summary(flows)
+        for s in summ.get("scanners", []):
+            if s["severity"] == "low":
+                continue
+            events.append({
+                "t": round(now, 3), "kind": "scanner", "ip": s["ip"],
+                "ports": s["ports"], "flows": s["flows"], "bytes": s["bytes"],
+                "severity": s["severity"], "risks": s["risks"][:4],
+            })
+
+        events.sort(key=lambda e: e.get("t", 0), reverse=True)
+        out = {
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "since": None if cutoff is None else round(cutoff, 3),
+            "cursor": round(now, 3),
+            "event_count": len(events),
+            "events": events[:limit],
+            "truncated": len(events) > limit,
+        }
+        if bad_since:
+            out["warning"] = "unparseable 'since' — defaulted to the last hour"
+        return _shrink_to_budget(out, self.AGENT_BUDGET_BYTES, drop_key="events")
+
+
+def parse_iso_maybe(text: str) -> float | None:
+    """ISO-8601 (or bare epoch seconds as a string) → unix float, else None.
+
+    Accepts the forms an agent is likely to send: '2026-10-05T12:34:56Z', with an
+    explicit offset, or date-only 'YYYY-MM-DD'. Naive timestamps are assumed UTC —
+    the dashboard's own clock and every stored timestamp are UTC, so interpreting
+    them in the host's local timezone would silently shift the diff window by the
+    zone offset (fromisoformat() does exactly that for a naive value).
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    candidate = text[:-1] if text.endswith("Z") else text
+    # Date-only has no time part at all; treat it as 00:00 UTC.
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", candidate):
+        candidate += "T00:00:00"
+    try:
+        dt = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+
+def _dir_size_mb(path: str) -> float | None:
+    """Total size of a directory in MB, or None when absent. Never raises."""
+    try:
+        total = 0
+        p = Path(path)
+        if not p.exists():
+            return None
+        for root, _dirs, files in os.walk(p):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    continue
+        return round(total / (1024 * 1024), 2)
+    except Exception:
+        return None
+
+
+def _count_cold_shards(cold_dir: str = DEFAULT_COLD_DIR) -> int:
+    try:
+        p = Path(cold_dir)
+        if not p.is_dir():
+            return 0
+        return sum(1 for f in p.iterdir()
+                   if f.is_file() and f.name.startswith("flows-") and f.suffix == ".zst")
+    except Exception:
+        return 0
+
+
+def _shrink_to_budget(payload: dict, budget: int, drop_key: str | None = None) -> dict:
+    """Guarantee the serialised body fits `budget` bytes.
+
+    The brief says the agent surface must "always" stay under ~32 kB, so this is
+    a real invariant, not a nicety. Arrays are trimmed from the tail in a fixed
+    order (largest first) until it fits, and `capped` records what was dropped so
+    a reader knows it is looking at a partial view.
+    """
+    def size(d):
+        return len(json.dumps(d, separators=(",", ":")).encode("utf-8"))
+
+    if size(payload) <= budget:
+        return payload
+
+    capped = {}
+    order = ([drop_key] if drop_key else []) + [
+        "alerts_last_24h", "threat_hits_last_24h", "top_anomalous_dests",
+        "top_countries", "verdicts",
+    ]
+    for key in order:
+        val = payload.get(key)
+        if not isinstance(val, list) or not val:
+            continue
+        capped[key] = len(val)
+        while val and size(payload) > budget:
+            val.pop()
+            payload[key] = val
+        if not val:
+            payload.pop(key, None)
+        if size(payload) <= budget:
+            break
+
+    if capped:
+        payload["capped"] = capped
+    # Last resort: nothing left to trim means the fixed overhead alone exceeds
+    # the budget. Report honestly instead of emitting broken JSON.
+    payload["_fits_budget"] = size(payload) <= budget
+    return payload
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -625,6 +1562,7 @@ header {
   transition: width 0.4s ease;
 }
 
+.vbar-seg.threat     { background: #ff2038; }
 .vbar-seg.alert      { background: var(--red); }
 .vbar-seg.suspicious { background: var(--orange); }
 .vbar-seg.noise      { background: var(--dim); }
@@ -636,6 +1574,7 @@ header {
 
 .vleg-item { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--muted); }
 .vleg-dot  { width: 8px; height: 8px; border-radius: 2px; flex-shrink: 0; }
+.vleg-dot.threat     { background: #ff2038; }
 .vleg-dot.alert      { background: var(--red); }
 .vleg-dot.suspicious { background: var(--orange); }
 .vleg-dot.noise      { background: var(--dim); }
@@ -721,6 +1660,12 @@ header {
 
 .verdict-tag.alert      { background: rgba(255,69,96,0.2); color: var(--red); border: 1px solid var(--red2); }
 .verdict-tag.suspicious { background: rgba(255,140,66,0.15); color: var(--orange); border: 1px solid #804020; }
+/* 'threat' = dest_ip matched a threat feed. Louder than 'alert' on purpose: it is
+   an external IOC match, not just a high nDPI risk score. */
+.verdict-tag.threat     { background: rgba(255,69,96,0.35); color: #fff; border: 1px solid var(--red);
+                          box-shadow: 0 0 6px rgba(255,69,96,0.6); }
+.verdict-tag.noise      { background: rgba(120,130,150,0.15); color: var(--muted); border: 1px solid var(--border); }
+.verdict-tag.safe       { background: rgba(0,212,170,0.12); color: var(--green, #00d4aa); border: 1px solid #1a4a40; }
 
 .alert-flow-str { font-size: 11px; color: var(--text); font-family: var(--font-mono); }
 .alert-reason   { font-size: 10px; color: var(--muted); }
@@ -843,6 +1788,8 @@ td {
 
 tr:hover td { background: var(--bg2); }
 
+tr.v-threat       { background: rgba(255,32,56,0.09); }
+tr.v-threat      td:first-child { border-left: 2px solid #ff2038; }
 tr.v-alert      { background: rgba(255,69,96,0.04); }
 tr.v-alert      td:first-child { border-left: 2px solid var(--red); }
 tr.v-suspicious td:first-child { border-left: 2px solid var(--orange); }
@@ -858,9 +1805,11 @@ tr.v-suspicious td:first-child { border-left: 2px solid var(--orange); }
 .c-score  { color: var(--red); text-align: right; }
 .c-risk   { color: var(--orange); max-width: 200px; white-space: normal; line-height: 1.3; }
 .c-enc    { text-align: center; }
+.c-geo    { font-size: 10px; color: var(--muted); white-space: nowrap; }
 .c-reason { color: var(--muted); font-size: 10px; }
 
 .vtag { display: inline-block; font-size: 9px; padding: 1px 4px; border-radius: 2px; font-weight: 600; letter-spacing: 0.3px; }
+.vtag.threat     { background: #ff2038; color: #fff; }
 .vtag.alert      { background: rgba(255,69,96,0.2); color: var(--red); }
 .vtag.suspicious { background: rgba(255,140,66,0.15); color: var(--orange); }
 .vtag.noise      { color: var(--dim); }
@@ -1050,12 +1999,14 @@ tr.v-suspicious td:first-child { border-left: 2px solid var(--orange); }
   <div class="verdict-bar" style="padding:12px 14px; margin: 0 0 14px;">
     <h3>Traffic verdict distribution</h3>
     <div class="vbar-track" id="vbar-track">
+      <div class="vbar-seg threat"     id="vbar-threat"     style="width:0%"></div>
       <div class="vbar-seg alert"      id="vbar-alert"      style="width:0%"></div>
       <div class="vbar-seg suspicious" id="vbar-suspicious" style="width:0%"></div>
       <div class="vbar-seg noise"      id="vbar-noise"      style="width:0%"></div>
       <div class="vbar-seg safe"       id="vbar-safe"       style="width:0%"></div>
     </div>
     <div class="vbar-legend">
+      <div class="vleg-item"><div class="vleg-dot threat"></div> <span id="vleg-threat">Threat</span></div>
       <div class="vleg-item"><div class="vleg-dot alert"></div> <span id="vleg-alert">Alert</span></div>
       <div class="vleg-item"><div class="vleg-dot suspicious"></div> <span id="vleg-susp">Suspicious</span></div>
       <div class="vleg-item"><div class="vleg-dot noise"></div> <span id="vleg-noise">Noise</span></div>
@@ -1135,6 +2086,7 @@ tr.v-suspicious td:first-child { border-left: 2px solid var(--orange); }
     <input class="filter-input" id="flow-filter" placeholder="Filter IP, port, protocol…" oninput="renderFlows()">
     <select class="sel" id="sel-verdict" onchange="renderFlows()">
       <option value="">All verdicts</option>
+      <option value="threat">Threat</option>
       <option value="alert">Alert</option>
       <option value="suspicious">Suspicious</option>
       <option value="noise">Noise</option>
@@ -1157,6 +2109,7 @@ tr.v-suspicious td:first-child { border-left: 2px solid var(--orange); }
         <th data-k="dst_port" style="text-align:right">Dport</th>
         <th data-k="ndpi.proto">L7</th>
         <th data-k="ndpi.category">Category</th>
+        <th data-k="dest_geo">Geo / ASN</th>
         <th data-k="ndpi.encrypted" style="text-align:center">Enc</th>
         <th data-k="_bytes" style="text-align:right">Bytes</th>
         <th data-k="_pkts"  style="text-align:right">Pkts</th>
@@ -1299,10 +2252,12 @@ function updateOverview() {
   // Verdict bar
   if (total > 0) {
     const pct = k => Math.round((v[k]||0)*100/total);
+    document.getElementById('vbar-threat').style.width      = pct('threat')+'%';
     document.getElementById('vbar-alert').style.width      = pct('alert')+'%';
     document.getElementById('vbar-suspicious').style.width = pct('suspicious')+'%';
     document.getElementById('vbar-noise').style.width      = pct('noise')+'%';
     document.getElementById('vbar-safe').style.width       = pct('safe')+'%';
+    document.getElementById('vleg-threat').textContent = `Threat (${pct('threat')}%)`;
     document.getElementById('vleg-alert').textContent = `Alert (${pct('alert')}%)`;
     document.getElementById('vleg-susp' ).textContent = `Suspicious (${pct('suspicious')}%)`;
     document.getElementById('vleg-noise').textContent = `Noise (${pct('noise')}%)`;
@@ -1323,13 +2278,21 @@ function updateOverview() {
     alertList.innerHTML = alertFlows.map(f => {
       const nd = f.ndpi || {};
       const flow_str = `${f.src_ip||'?'}:${f.src_port||'?'} → ${f.dest_ip||'?'}:${f.dst_port||'?'}`;
+      // Geo/ASN and threat source are optional — absent when GeoLite2 or the
+      // feed is unavailable, so build the suffix only from what exists.
+      const geoBits = [f.dest_geo, f.asn ? 'AS'+f.asn : null, f.asn_org]
+                        .filter(Boolean).join(' · ');
+      const bits = [];
+      if (f.threat_source) bits.push(`feed match: ${f.threat_source}`);
+      if (geoBits)         bits.push(geoBits);
+      const suffix = bits.length ? ' · ' + esc(bits.join(' · ')) : '';
       return `<div class="alert-row" onclick="showModal(${JSON.stringify(JSON.stringify(f)).slice(1,-1)})">
         <div class="alert-row-top">
           <span class="verdict-tag ${f._verdict}">${f._verdict}</span>
           <span class="alert-flow-str">${esc(flow_str)}</span>
           <span class="alert-risk">${esc(f._risktext||'')}</span>
         </div>
-        <div class="alert-reason">${esc(f._reason||'')} · ${esc(nd.proto||f.proto||'')} ${esc(nd.category||'')}</div>
+        <div class="alert-reason">${esc(f._reason||'')} · ${esc(nd.proto||f.proto||'')} ${esc(nd.category||'')}${suffix}</div>
       </div>`;
     }).join('');
   }
@@ -1476,13 +2439,19 @@ function renderFlows() {
 
   document.getElementById('flow-tbody').innerHTML = rows.length
     ? rows.map(f => flowRow(f)).join('')
-    : '<tr><td colspan="14" class="no-data">No flows match.</td></tr>';
+    : '<tr><td colspan="15" class="no-data">No flows match.</td></tr>';
 }
 
 function flowRow(f) {
   const nd = f.ndpi || {};
-  const cls = f._verdict === 'alert' || f._verdict === 'suspicious' ? `v-${f._verdict}` : '';
+  const cls = (f._verdict === 'alert' || f._verdict === 'suspicious' || f._verdict === 'threat')
+    ? `v-${f._verdict}` : '';
   const proto = f.proto || '';
+  // Geo column degrades to blank when GeoLite2 is absent — never "null".
+  const geoBits = [];
+  if (f.country_iso) geoBits.push(f.country_iso);
+  if (f.asn)         geoBits.push('AS' + f.asn);
+  const geoCell = geoBits.join(' ') || '<span style="color:var(--dim)">—</span>';
   return `<tr class="${cls}" onclick="showModal('${encodeFlow(f)}')" style="cursor:pointer">
     <td><span class="vtag ${f._verdict}">${f._verdict}</span></td>
     <td><span class="badge ${proto.toLowerCase()}">${esc(proto)}</span></td>
@@ -1493,6 +2462,7 @@ function flowRow(f) {
     <td class="c-port">${f.dst_port||'—'}</td>
     <td class="c-l7">${esc(nd.proto||'')}</td>
     <td class="c-cat">${esc(nd.category||'')}</td>
+    <td class="c-geo" title="${esc(f.asn_org||f.dest_geo||'')}">${geoCell}</td>
     <td class="c-enc">${nd.encrypted ? '🔒' : ''}</td>
     <td class="c-bytes">${fmtBytes(f._bytes)}</td>
     <td class="c-pkts">${f._pkts||'—'}</td>
@@ -1691,6 +2661,8 @@ function matchQ(f, q) {
           (nd.proto||'') + ' ' + (nd.category||'') + ' ' +
           (nd.hostname||'') + ' ' + (f._sni||'') + ' ' +
           (f.server_hostname||'') + ' ' +
+          (f.country_iso||'') + ' ' + (f.asn_org||'') + ' AS' + (f.asn||'') + ' ' +
+          (f.threat_source||'') + ' ' +
           f._risktext + ' ' + f._verdict + ' ' + f._reason)
          .toLowerCase().includes(q);
 }
@@ -1738,10 +2710,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     data_file:      str = DEFAULT_DATA_FILE
     html_dir:       str = DEFAULT_HTML_DIR
     whitelist_file: str = DEFAULT_WHITELIST
+    # Task 2 knobs surfaced through /api/agent/status (set in main()).
+    retention_days: int = 7
 
     def log_message(self, fmt, *args):
         if args and str(args[1]) not in ('200', '304'):
             super().log_message(fmt, *args)
+
+    def _query(self) -> dict:
+        """Parse the query string once per request."""
+        qs = self.path.split('?', 1)[1] if '?' in self.path else ''
+        return urllib.parse.parse_qs(qs, keep_blank_values=True)
 
     def do_GET(self):
         path = self.path.split('?')[0]
@@ -1771,7 +2750,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == '/api/alerts':
             raw = _load_flows(self.data_file)
             enriched = _analytics.enrich(raw)
-            alerts = [f for f in enriched if f.get('_verdict') in ('alert', 'suspicious')]
+            alerts = [f for f in enriched if f.get('_verdict') in ('alert', 'suspicious', 'threat')]
             alerts.sort(key=lambda x: x.get('_riskscore', 0), reverse=True)
             self._json(alerts[:500])
 
@@ -1780,6 +2759,73 @@ class Handler(http.server.BaseHTTPRequestHandler):
             enriched = _analytics.enrich(raw)
             summ = _analytics.summary(enriched)
             self._json(summ.get('scanners', []))
+
+        elif path == '/api/protocols':
+            # Documented since the first version but never actually routed; the
+            # dashboard's protocol tab was reading it off /api/summary instead.
+            raw = _load_flows(self.data_file)
+            enriched = _analytics.enrich(raw)
+            summ = _analytics.summary(enriched)
+            self._json({
+                'protocols':  [{'proto': p, 'bytes': b} for p, b in summ.get('top_proto', [])],
+                'categories': [{'category': c, 'count': n} for c, n in summ.get('top_category', [])],
+            })
+
+        # ── Task 4: agent-facing surface ─────────────────────────────────────
+        elif path == '/api/agent/status':
+            raw = _load_flows(self.data_file)
+            enriched = _analytics.enrich(raw)
+            self._json(_analytics.agent_status(enriched, self.retention_days))
+
+        elif path == '/api/agent/diff':
+            q = self._query()
+            since_raw = (q.get('since') or [None])[0]
+            limit_raw = (q.get('limit') or ['200'])[0]
+            try:
+                limit = max(1, min(1000, int(limit_raw)))
+            except ValueError:
+                limit = 200
+            raw = _load_flows(self.data_file)
+            enriched = _analytics.enrich(raw)
+            self._json(_analytics.agent_diff(enriched, since_raw, limit=limit))
+
+        elif path == '/api/agent/schema':
+            # Self-describing so an agent can read one endpoint and know how to
+            # use the rest without being handed prose.
+            self._json({
+                "endpoints": {
+                    "/api/agent/status": "compact snapshot: counts, last-24h alerts/threats, anomalous dests, geo+feed status. Capped at ~30 kB.",
+                    "/api/agent/diff?since=<ISO8601|epoch>": "events newer than `since` (kinds: threat|alert|suspicious|scanner). Echoes `cursor` to pass back next poll.",
+                    "/api/flows": "full enriched flow list (large; prefer the agent endpoints)",
+                    "/api/summary": "aggregate stats incl. top_countries + threat_count",
+                    "/api/alerts": "alert/suspicious/threat flows, up to 500",
+                    "/api/scanners": "port-scanner detections by source IP",
+                    "/api/timeline": "per-minute traffic buckets",
+                    "/api/protocols": "protocol and category distribution",
+                },
+                "verdicts_ordered_by_severity": ["threat", "alert", "suspicious", "noise", "safe"],
+                "verdict_meaning": {
+                    "threat": "dest_ip is listed in threats.json from abuse.ch (outranks the whitelist)",
+                    "alert": "high-signal nDPI risk, or risk score >= 50 with non-noise risks",
+                    "suspicious": "risk score >= 10",
+                    "noise": "trusted ASN/prefix/org, or background internet noise",
+                    "safe": "no indicators",
+                },
+                "per_flow_fields_added": {
+                    "country_iso": "GeoLite2-City country code, null when geo unavailable",
+                    "asn": "real ASN number from GeoLite2-ASN (what the whitelist matches on)",
+                    "asn_org": "ASN organisation name",
+                    "dest_geo": "'City, Country' display string or null",
+                    "threat_source": "the exact IP or CIDR from threats.json that matched dest_ip",
+                },
+                "offline_summaries": {
+                    "summary_sqlite": DEFAULT_SUMMARY_DB,
+                    "cold_shards": DEFAULT_COLD_DIR + "/flows-YYYY-MM-DD.ndjson.zst",
+                    "tables": ["daily_summary(date,total_flows,bytes_out,bytes_in,distinct_dests,alerts,top_talkers_json,top_countries_json)",
+                               "dest_rollup(dest_ip,iso,asn_org,asn,first_seen,last_seen,flows,bytes,alert_count)"],
+                    "written_by": "distill.py",
+                },
+            })
 
         else:
             served = self._try_static(self.path)
@@ -1839,13 +2885,22 @@ def main():
     p.add_argument('--html',      type=str, default=DEFAULT_HTML_DIR,   metavar='DIR')
     p.add_argument('--whitelist', type=str, default=DEFAULT_WHITELIST,  metavar='PATH',
                    help='JSON file with trusted ASNs / org fragments')
+    p.add_argument('--mmdb-dir',  type=str, default=DEFAULT_MMDB_DIR,   metavar='DIR',
+                   help='GeoLite2 directory (env NETFLOW_MMDB_DIR); absent → geo degrades to null')
+    p.add_argument('--threats',   type=str, default=DEFAULT_THREATS,    metavar='PATH',
+                   help='threats.json written by threat_intel.py')
+    p.add_argument('--retain-days', type=int, default=int(os.environ.get('FLOW_RETAIN_DAYS', 7)),
+                   metavar='N', help='hot retention window reported by /api/agent/status')
     args = p.parse_args()
 
     Handler.data_file      = args.data
     Handler.html_dir       = args.html
     Handler.whitelist_file = args.whitelist
+    Handler.retention_days = max(0, args.retain_days)
 
-    _analytics = FlowAnalytics(args.whitelist)
+    geo = GeoReader(mmdb_dir=args.mmdb_dir)
+    threats = ThreatStore(args.threats)
+    _analytics = FlowAnalytics(args.whitelist, geo=geo, threats=threats)
 
     Path(args.html).mkdir(parents=True, exist_ok=True)
 
@@ -1855,14 +2910,28 @@ def main():
     print(f"Data file:    {args.data}")
     print(f"Whitelist:    {args.whitelist}")
     print(f"Static files: {args.html}/")
+    if geo.available:
+        print(f"GeoIP:        {args.mmdb_dir} (city={bool(geo._city)} asn={bool(geo._asn)})")
+    else:
+        print(f"GeoIP:        UNAVAILABLE — {geo.error}; country_iso/asn stay null")
+    if threats.ips or threats.nets:
+        print(f"Threat feed:  {len(threats.ips)} IP(s), {len(threats.nets)} CIDR(s) "
+              f"(retrieved {threats.retrieved_at})")
+    else:
+        print(f"Threat feed:  EMPTY — {threats.error or args.threats + ' not loaded'}; "
+              f"no flow can be verdict 'threat'")
     print(f"Started:      {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
     print("API endpoints:")
-    print(f"  GET /api/flows     — enriched flow list (verdict, risk, reason)")
-    print(f"  GET /api/summary   — aggregate stats, top talkers, scanners")
-    print(f"  GET /api/timeline  — per-minute traffic buckets")
-    print(f"  GET /api/alerts    — alert/suspicious flows only")
-    print(f"  GET /api/scanners  — detected port scanners")
+    print(f"  GET /api/flows        — enriched flow list (verdict, risk, reason, geo)")
+    print(f"  GET /api/summary      — aggregate stats, top talkers, scanners")
+    print(f"  GET /api/timeline     — per-minute traffic buckets")
+    print(f"  GET /api/alerts       — alert/suspicious/threat flows only")
+    print(f"  GET /api/scanners     — detected port scanners")
+    print(f"  GET /api/protocols    — protocol + category distribution")
+    print(f"  GET /api/agent/status — compact agent snapshot (<30 kB)")
+    print(f"  GET /api/agent/diff   — events since ?since=<ISO|epoch>")
+    print(f"  GET /api/agent/schema — self-describing endpoint contract")
     print("\nCtrl-C to stop.\n")
 
     try:

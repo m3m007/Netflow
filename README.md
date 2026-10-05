@@ -394,6 +394,97 @@ in its library: `ndpiReader -i lo -s 2 --debug-files` and inspect what fields ap
 
 ---
 
+## New scripts (retention, threat intel, agent API)
+
+Four deterministic additions. No LLM runs in any daily path — an agent reads only
+the distilled summaries these produce.
+
+### `distill.py` — cold shards → `summary.sqlite`
+
+Rolls the archives written by the daemon's retention task into one small SQLite
+file. This is the intended long-term query surface (schema documented in the
+file's own header comment):
+
+```bash
+python3 distill.py                    # ./cold/* → ./ndpi_state/summary.sqlite
+python3 distill.py --rebuild          # full recompute from all shards
+python3 distill.py --dry-run          # aggregate and report, write nothing
+sqlite3 ndpi_state/summary.sqlite 'select * from daily_summary order by date desc limit 7;'
+```
+
+Idempotent: re-running on the same shard set produces identical tables.
+
+### `threat_intel.py` — abuse.ch feeds → `threats.json`
+
+Polls Feodo Tracker, URLhaus and ThreatFox, reduces them to IP/CIDR sets, and
+writes `./ndpi_state/threats.json` atomically (temp file + `os.replace`). A feed
+that fails is skipped and its last-good set carried forward, so a total network
+outage drops nothing and flags `stale_sources`.
+
+```bash
+python3 threat_intel.py --once        # single pass, for cron/systemd
+python3 threat_intel.py               # keep polling every 15 min
+python3 threat_intel.py --base-url http://127.0.0.1:9 --once   # offline proof
+```
+
+`flow_server.py` joins each flow's `dest_ip` against it; a match becomes verdict
+`threat` (highest severity, outranks the whitelist) with `threat_source` set.
+
+### Retention in `flow_monitor` (Rust)
+
+The sled tree used to be insert-only. Records are now keyed by big-endian
+`first_seen` + 5-tuple hash, so expiry is a ranged scan instead of a full
+deserialise, and expired flows move to `cold/flows-YYYY-MM-DD.ndjson.zst`
+(compressed via the `zstd` CLI) before removal — archive first, delete second.
+
+```bash
+flow_monitor --retain-days 7            # default; 0 disables retention entirely
+FLOW_COLD_DIR=/data/cold flow_monitor   # env equivalents of both flags
+```
+
+Legacy 8-byte keys are still read correctly and are re-keyed in place on the
+first retention pass, so an existing `./ndpi_db` needs no offline migration step.
+
+### Agent endpoints (`flow_server.py`)
+
+```bash
+curl localhost:7000/api/agent/status                            # snapshot, capped under 30 kB
+curl "localhost:7000/api/agent/diff?since=$(date -u -Iseconds)" # events since a cursor
+curl localhost:7000/api/agent/schema                            # self-describing contract
+```
+
+### GeoIP / ASN enrichment
+
+Enrichment calls `libmaxminddb` through `ctypes`, so the Python server stays
+stdlib-only. Databases are looked for in `$NETFLOW_MMDB_DIR` (default
+`/usr/share/GeoIP`). When they are absent every geo field is `null` and nothing
+fails — the whitelist then falls back to its previous hostname/prefix behaviour.
+
+```bash
+pacman -S --noconfirm base-devel libmaxminddb geoipupdate zstd
+
+# /etc/GeoIP.conf — v7 syntax. Keys are case-sensitive and `PRODUCT` is NOT one
+# of them (that older form makes geoipupdate fail with "unknown option on line 1").
+# Official auto-updates need a free LicenseKey from dev.maxmind.com.
+cat > /etc/GeoIP.conf <<'CONF'
+AccountID <your-account-id>
+LicenseKey <your-license-key>
+EditionIDs GeoLite2-City GeoLite2-ASN
+DatabaseDirectory /usr/share/GeoIP
+CONF
+
+mkdir -p /usr/share/GeoIP && geoipupdate -v
+```
+
+Without a LicenseKey, keep `/etc/GeoIP.conf` absent (e.g. move it to
+`/etc/GeoIP.conf.bak`) so `geoipupdate` does not error when run from cron, and
+refresh the two `.mmdb` files by other means. Enrichment reads whatever is
+present in `$NETFLOW_MMDB_DIR` and degrades to `null` when it is missing.
+
+New per-flow fields: `country_iso`, `asn`, `asn_org`, `dest_geo`, `threat_source`.
+
+---
+
 ## Notes on nDPI versions
 
 The JSON field layout was verified against nDPI 4.x and 5.x.
