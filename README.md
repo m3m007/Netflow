@@ -494,8 +494,12 @@ Key quirks to be aware of if you are debugging a different build:
   asymmetric with `"dst_port"` and differs from many other tools' conventions.
 - All nDPI classification fields (`proto`, `breed`, `category`, `flow_risk`, …)
   are nested inside a `"ndpi"` sub-object, not at the top level.
-- Byte and packet counters (`cli2srv_bytes`, etc.) are only present if your
-  ndpiReader was compiled with `--enable-flow-stats` or equivalent.
+- Byte and packet counters (`cli2srv_bytes`, `src2dst_packets`, …) require the
+  runtime flag `-F` ("Enable flow stats") on the ndpiReader command line. They are
+  NOT gated by a configure/build option — any stock build emits them when you pass
+  `-F`. (flow_monitor adds `-F` automatically; if you see these fields missing,
+  check your invocation.) The `cli2srv_*` spelling belongs to ntopng's export
+  format; ndpiReader's own JSON uses `src2dst_/dst2src_` names inside `"xfer"`.
 - `tcp_fingerprint` is a nDPI 5.x field and will be absent in 4.x output.
 
 ---
